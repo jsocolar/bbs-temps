@@ -68,4 +68,4 @@ nestwatch_categories <- list(
    other = c("bluebi", "swallo", "bluebo1", "spizel", "wren1")
 )
 
-saveRDS(nestwatch_categories, "/Users/Jacob/Dropbox/Work/Code/bbs-temps/data/nestwatch_categories.RDS")
+usethis::use_data(nestwatch_categories)
