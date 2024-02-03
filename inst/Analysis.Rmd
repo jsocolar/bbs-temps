@@ -1,0 +1,450 @@
+---
+title: "BBS/weather"
+author: "Jacob Socolar"
+date: "`r Sys.Date()`"
+output: html_document
+params: 
+  redownload: FALSE
+  bbs_release: 2022
+  species_list_path: "/Users/jacob/dropbox/work/BBS_Project/BBS_Data/SpeciesList.csv"
+  daymet_path: "/Users/jacob/Dropbox/Work/BBS_weather2/daymet.RDS"
+  elevations_path: "/Users/jacob/Dropbox/Work/BBS_weather2/elevs.RDS"
+  nestwatch_path: "/Users/Jacob/Dropbox/Work/Nestwatch/AllLocations.csv"
+  full_data_path: "/Users/jacob/Dropbox/Work/BBS_weather2/full_data.RDS"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+```{r debug, eval=FALSE}
+params <- list(
+  redownload = FALSE,
+  bbs_release = 2022,
+  species_list_path = "/Users/jacob/dropbox/work/BBS_Project/BBS_Data/SpeciesList.csv",
+  daymet_path = "/Users/jacob/Dropbox/Work/BBS_weather2/daymet.RDS",
+  elevations_path = "/Users/jacob/Dropbox/Work/BBS_weather2/elevs.RDS",
+  nestwatch_path = "/Users/Jacob/Dropbox/Work/Nestwatch/AllLocations.csv",
+  full_data_path = "/Users/jacob/Dropbox/Work/BBS_weather2/full_data.RDS"
+)
+
+```
+
+```{r packages}
+# remotes::install_github("jsocolar/bbsBayes") # must have this version to lump
+                                               # Northwestern Crow properly
+library(bbsBayes)
+library(dplyr)
+library(sf)
+library(mgcv)
+library(brms)
+library(ggplot2)
+library(magrittr)
+assertthat::assert_that("daymetr" %in% rownames(installed.packages()))
+assertthat::assert_that("lubridate" %in% rownames(installed.packages()))
+assertthat::assert_that("rgee" %in% rownames(installed.packages()))
+
+```
+
+# Data download and import
+## BBS
+```{r get-bbs-data}
+fetch_bbs_data(release = params$bbs_release, force = params$redownload)
+
+# Load bbs data (this also stratifies by lat/lon blocks in case we want that later)
+# this function lumps taxa to parent forms
+bbs <- stratify(by = "latlong", quiet = TRUE)
+
+# We'll do one bit of BBS munging upfront, because we'll use it repeatedly for 
+# downloading other sources
+unique_routes <- bbs$route_strat |>
+    mutate(route_id = paste(countrynum, statenum, Route, sep = "_")) |>
+    select(c("route_id", "Latitude", "Longitude")) |>
+    filter(!duplicated(route_id))
+
+```
+
+## Elevations (ALOS-PALSAR)
+```{r get-elevation-data}
+if(params$redownload | !file.exists(params$elevations_path)){
+  library(rgee)
+  ee_Initialize()
+  unique_routes_sf <- unique_routes |>
+    st_as_sf(coords = c("Longitude", "Latitude")) |>
+    st_set_crs(4326)
+
+  ALOS <- ee$Image('JAXA/ALOS/AW3D30/V2_2')$select('AVE_DSM')
+  unique_route_elevs <- ee_extract(
+    x = ALOS,
+    y =  unique_routes_sf[1:5000, ], # google caps us at 5000 elements...
+    fun = ee$Reducer$mean(),
+    scale = 1
+    ) |>
+    rbind(                           # ... so we do this in two batches and rbind
+      ee_extract(
+        x = ALOS,
+        y =  unique_routes_sf[5001:nrow(unique_routes_sf), ],
+        fun = ee$Reducer$mean(),
+        scale = 1
+        )
+    ) |>
+    rename(elev = AVE_DSM)
+  
+  saveRDS(unique_route_elevs, params$elevations_path)
+} else {
+  unique_route_elevs <- readRDS(params$elevations_path)
+}
+
+```
+
+## Daymet
+```{r get-daymet-data}
+if(params$redownload | !file.exists(params$daymet_path)){
+  routes_csv_path <- file.path(tempdir(), "routes.csv")
+  
+  unique_routes |>
+    rename(site = route_id, latitude = Latitude, longitude = Longitude) |>
+    write.csv(file = routes_csv_path, row.names = FALSE)
+
+  daymet <- daymetr::download_daymet_batch(
+    file_location = routes_csv_path,
+    start = 1980,
+    end = 2022,
+    internal = TRUE
+  )
+  saveRDS(daymet, params$daymet_path)
+} else {
+  daymet <- readRDS(params$daymet_path)
+}
+
+```
+
+## Species info
+```{r species-to-use}
+species_list <- read.csv(params$species_list_path) |>
+  filter(ORDER == "Passeriformes") |>
+  filter(Genus != "Empidonax") |>
+  filter(is.na(Mexican.southern.range.)) |>
+  filter(is.na(Breed.in.saltmarsh.)) |>
+  filter(is.na(Alt..problem.))
+
+```
+
+## Nestwatch
+```{r nestwatch}
+nestwatch <- read.csv(params$nestwatch_path)
+
+```
+
+# Nestwatch model
+```{r nestwatch-munging-and-model}
+# clip to species of interest
+nestwatch_use <- nestwatch |>
+  filter(SPECIES_CODE %in% nestwatch_categories$passerines_use) |> # species to use
+  filter(FIRST_LAY_DT != "") |> # known lay date
+  mutate(
+    date = as.Date(substr(FIRST_LAY_DT, 1, 9), format="%d%B%Y"),
+    year = lubridate::year(date), 
+    jday = lubridate::yday(date)
+    ) |> # get lay date
+  filter(jday < 182) |> # remove lay dates after june 30
+  filter( # trim to a reasonable geography
+    LONGITUDE < -50  & LATITUDE < 70 & LATITUDE > 26 & ELEVATION_M < 4000
+    ) |>
+  filter(
+    !(SUBNATIONAL1_CODE == "US-NY" & ELEVATION_M > 1500)
+  ) |>
+  mutate(SPECIES_CODE = as.factor(SPECIES_CODE)) |>
+  rename(
+    Latitude = LATITUDE,
+    Longitude = LONGITUDE,
+    elev = ELEVATION_M
+  )
+
+# Nest date model
+# nest_model <- 
+#   gam(
+#     jday ~ elev + Latitude +
+#       s(SPECIES_CODE, bs = "re") + 
+# #      s(SPECIES_CODE, elev, bs = "re") + s(SPECIES_CODE, Latitude, bs = "re") +
+#       s(elev) + #t2(Longitude, Latitude), 
+#       s(Latitude),
+#     data = nestwatch_use
+#   )
+nest_model <- 
+  gam(
+    jday ~ elev + Latitude +
+      s(SPECIES_CODE, bs = "re") + 
+      t2(elev, Latitude, k = 3), # we need to restrict the basis dimension to avoid
+        # weird artifacts near the margins of the study area, and particularly when
+        # predictions are extrapolating into regions of poor nestwatch coverage
+    data = nestwatch_use
+  )
+
+summary(nest_model)
+plot(nest_model, scheme = 2)
+# plot(nest_model, scheme = 2, select = 3)
+# points(nestwatch_use$Latitude ~ nestwatch_use$Longitude, pch = '.')
+
+unique_routes2 <- unique_routes |>
+  merge(unique_route_elevs)
+
+nest_species <- unique(nestwatch_use$SPECIES_CODE)
+
+nest_predictions <- matrix(NA, nrow = nrow(unique_routes), ncol = length(nest_species))
+for(i in seq_along(nest_species)){
+  pp_sp <- unique_routes2 |>
+    mutate(SPECIES_CODE = nest_species[i])
+  nest_predictions[,i] <- predict(nest_model, pp_sp)
+}
+
+routes_elevs_nests <- unique_routes2 |>
+  mutate(mean_nest = apply(nest_predictions, 1, mean)) |>
+  mutate(sd_nest = apply(nest_predictions, 1, sd))
+
+ggplot(routes_elevs_nests, aes(x = Longitude, y = Latitude)) +
+  geom_point(aes(col = mean_nest)) + scale_color_viridis_c()
+
+```
+
+# Data munging
+## Daymet
+```{r daymet-munging}
+nesting_dates <- function(x){
+  lay <- routes_elevs_nests$mean_nest[routes_elevs_nests$route_id == x$site] |>
+    round()
+  c(lay, lay + 30)
+}
+
+years <- c(1980:2022)
+weather_deets <- lapply(
+  daymet, 
+  summarize_daymet, 
+  "tmax..deg.c.", 
+  days = c(182, 243), 
+  years = years
+  ) %>%
+  do.call(rbind, .) |>
+  mutate(
+    route_id = rep(unique_routes$route_id, each = length(years))
+  ) |>
+  rename(summer_temp = tmax..deg.c.) |>
+  mutate(
+    nesting_temp = lapply(
+      daymet, 
+      summarize_daymet, 
+      "tmax..deg.c.", 
+      days = nesting_dates, 
+      years = years
+      ) %>%
+      do.call(rbind, .) |>
+      select(tmax..deg.c.) |>
+      pull()
+    ) |>
+  rename(Year = year)
+
+plot(summer_temp ~ nesting_temp, data = weather_deets)
+abline(a=0, b=1, col = "dodgerblue")
+
+```
+# Create a unified dataframe combining BBS and weather
+## BBS check and join
+```{r bbs-munging}
+# Load raw data to check whether stratify2 did what we expect:
+bbs_data <- load_bbs_data()
+
+# Check that the sets of species are the same:
+strat_species <- unique(bbs$bird_strat$AOU) |>
+  order_self()
+raw_species <- unique(bbs_data$bird$AOU) |>
+  order_self()
+assertthat::assert_that(all.equal(raw_species, strat_species))
+
+# Check that differences in the number of rows are all due to lumping
+v <- vector()
+ind <- 0
+for(i in seq_along(strat_species)){
+  a <- sum(bbs_data$bird$AOU == strat_species[i])
+  b <- sum(bbs$bird_strat$AOU == strat_species[i])
+  if(a != b){
+    assertthat::assert_that(b > a) # This should be true if all differences are due to lumping
+    ind = ind + 1
+    v[ind] <- strat_species[i]
+  }
+}
+
+# These should all be lumped forms if all differences are due to lumping
+bbs$species_strat$english[bbs$species_strat$sp.bbs %in% v]
+
+##### subset and rename #####
+route_strat <- bbs$route_strat |>
+  mutate(route_id = paste(countrynum, statenum, Route, sep = "_")) |>
+  mutate(yday = lubridate::yday(
+    as.Date(paste(Year,Month,Day,sep="-"),"%Y-%m-%d")
+    )
+  ) |>
+  select(c("route_id", "ObsN", "strat_name", "Year", "yday", "StartTime", "EndTime", 
+           "StartTemp", "EndTemp", "TempScale", 
+           "Latitude", "Longitude", "BCR")) |>
+  left_join(routes_elevs_nests, by = "route_id")
+
+bird_strat <- bbs$bird_strat |>
+  mutate(route_id = paste(countrynum, statenum, Route, sep = "_"))
+  
+species_strat <- bbs$species_strat |>
+  rename(AOU = sp.bbs)
+
+##### Create unified dataframe #####
+bbs_unified <- bird_strat |>
+  left_join(route_strat, by = c("route_id", "Year")) |>
+  left_join(species_strat, by = "AOU") |>
+  filter(!is.na(BCR.y)) |> # the NAs are the routes that didn't pass QC for 
+   # weather. See bbsBayes::fetch_bbs_data near line 80
+  filter(Year > 1979) |>
+  filter(AOU %in% species_list$AOU) |>
+  # At this point there are 3673 species-route-years with duplicates (out of 
+  # > 3 million total). We will remove them. It would be possible to do this
+  # in a clever way to minimize the reduction in analyzable lags, but I'm not
+  # going to worry about it.
+  mutate(unique_id = paste(route_id, Year, AOU, sep = "__")) |>
+  filter(!duplicated(unique_id)) %T>%
+  assertthat::assert_that(all.equal(BCR.x, BCR.y), env = .) %T>%
+  assertthat::assert_that(all.equal(Latitude.x, Latitude.y), env = .) |>
+  select(
+    c("route_id", "Year", "AOU", "english", "genus", "species", "SpeciesTotal",
+      "Latitude.x", "Longitude.x", "BCR.x", "strat_name", "yday", "ObsN",
+      "StartTime", "EndTime", "StartTemp", "EndTemp", "TempScale", "elev", 
+      "mean_nest")
+  ) |>
+  rename(
+    Latitude = Latitude.x, Longitude = Longitude.x, BCR = BCR.x
+  ) |>
+  left_join(weather_deets, by = c("route_id", "Year"))
+
+```
+
+
+```{r create-lags-and-filter}
+bbs2 <- bbs_unified |>
+  mutate(Year = Year - 1) |>
+  select(
+    c("route_id", "Year", "AOU", "SpeciesTotal", 
+      "yday", "ObsN", "StartTime", "EndTime", "StartTemp", "EndTemp", 
+      "TempScale", "summer_temp", "nesting_temp")
+    ) |>
+  rename(
+    SpeciesTotal2 = SpeciesTotal,
+    yday2 = yday,
+    ObsN2 = ObsN,
+    StartTime2 = StartTime,
+    EndTime2 = EndTime,
+    StartTemp2 = StartTemp,
+    EndTemp2 = EndTemp,
+    TempScale2 = TempScale,
+    summer_temp2 = summer_temp,
+    nesting_temp2 = nesting_temp
+  )
+
+lags <- bbs_unified |>
+  left_join(bbs2, by = c("route_id", "Year", "AOU")) |>
+  filter(!is.na(SpeciesTotal2)) |>
+  filter(ObsN == ObsN2) |>
+  filter(abs(yday - yday2) <= 10) |>
+#  filter(SpeciesTotal >= 5 & SpeciesTotal2 >= 5) |>
+  mutate(
+    lag = log(SpeciesTotal2) - log(SpeciesTotal)
+  )
+# filter: start time too different, end time too different, start temp too different
+
+```
+
+```{r niches-and-anomalies}
+# get mean temps for each route
+route_mean_temps <- weather_deets |>
+  group_by(route_id) |>
+  summarise(
+    route_mean_summer_temp = mean(summer_temp),
+    route_mean_nesting_temp = mean(nesting_temp)
+    )
+
+plot(route_mean_summer_temp ~ route_mean_nesting_temp, data = route_mean_temps, pch = ".")
+abline(0, 1, col = "dodgerblue")
+
+ggplot(route_mean_temps |> left_join(unique_routes) , aes(x = Longitude, y = Latitude)) +
+  geom_point(aes(col = route_mean_summer_temp)) + scale_color_viridis_c()
+
+
+species_temp_range_summary <- function(AOU){
+  x <- AOU
+  unique_routes <- bbs_unified |>
+    filter(AOU == x) |>
+    select(route_id) |>
+    pull() |>
+    unique()
+  
+  temps <- route_mean_temps |>
+    filter(route_id %in% unique_routes) |>
+    select(!route_id)
+  
+  list(
+    apply(temps, 2, mean, na.rm = TRUE) |>
+      matrix(nrow = 1) |>
+      as.data.frame() |>
+      setNames(gsub("route", "species", names(temps))),
+    apply(temps, 2, sd, na.rm = TRUE) |>
+      matrix(nrow = 1) |>
+      as.data.frame() |>
+      setNames(gsub("mean", "sd", gsub("route", "species", names(temps)))),
+    apply(temps, 2, IQR, na.rm = TRUE) |>
+      matrix(nrow = 1) |>
+      as.data.frame() |>
+      setNames(gsub("mean", "iqr", gsub("route", "species", names(temps))))
+  ) %>%
+    do.call(cbind, .)
+}
+
+species_temps <- sapply(species_list$AOU, species_temp_range_summary, simplify = FALSE) %>%
+  do.call(rbind, .) |>
+  mutate(AOU = species_list$AOU)
+
+hist(species_temps$species_mean_summer_temp)
+hist(species_temps$species_mean_nesting_temp)
+plot(species_mean_summer_temp ~ species_mean_nesting_temp, data = species_temps)
+abline(0, 1)
+hist(species_temps$species_iqr_summer_temp)
+hist(species_temps$species_iqr_nesting_temp)
+hist(species_temps$species_sd_summer_temp)
+hist(species_temps$species_sd_nesting_temp)
+
+full_data <- lags |>
+  left_join(route_mean_temps) |>
+  left_join(species_temps) |>
+  mutate(
+    summer_temp_anomaly = summer_temp - route_mean_summer_temp,
+    nesting_temp_anomaly = nesting_temp - route_mean_nesting_temp,
+    summer_temp_zscore = (route_mean_summer_temp - species_mean_summer_temp)/species_sd_summer_temp,
+    nesting_temp_zscore = (route_mean_nesting_temp - species_mean_nesting_temp)/species_sd_nesting_temp
+  )
+
+saveRDS(full_data, params$full_data_path)
+
+```
+
+
+```{r models}
+full_data <- readRDS(params$full_data_path)
+summer_mod <- brm(
+  lag ~ summer_temp_anomaly * summer_temp_zscore + 
+    (1 + summer_temp_anomaly * summer_temp_zscore | AOU) +
+    gp(Latitude, Longitude, k = 10, c = 5/4),
+  data = full_data,
+  backend = "cmdstanr",
+  cores = 4,
+  refresh = 1
+)
+
+
+print(summer_mod, digits = 10)
+```
+
