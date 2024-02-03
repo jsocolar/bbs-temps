@@ -34,6 +34,7 @@ params <- list(
 ```{r packages}
 # remotes::install_github("jsocolar/bbsBayes") # must have this version to lump
                                                # Northwestern Crow properly
+library(bbsTemps)
 library(bbsBayes)
 library(dplyr)
 library(sf)
@@ -256,9 +257,9 @@ bbs_data <- load_bbs_data()
 
 # Check that the sets of species are the same:
 strat_species <- unique(bbs$bird_strat$AOU) |>
-  order_self()
+  sort()
 raw_species <- unique(bbs_data$bird$AOU) |>
-  order_self()
+  sort()
 assertthat::assert_that(all.equal(raw_species, strat_species))
 
 # Check that differences in the number of rows are all due to lumping
